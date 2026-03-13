@@ -7,24 +7,26 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 
-# Load environment variables
+# 1. Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
 
-# ── DATABASE CONFIGURATION ───────────────────────────────────────────────
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///safeher.db'
+# 2. Updated CORS to be more robust for deployment
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# 3. Database Configuration
+# We will use aashray.db as your primary name
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///aashray.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-
+# ── DATABASE MODELS ──────────────────────────────────────────────────
 class ChatMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     role = db.Column(db.String(50), nullable=False)
     content = db.Column(db.Text, nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-
 
 class AssessmentScore(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -34,30 +36,35 @@ class AssessmentScore(db.Model):
     risk_level = db.Column(db.String(50))
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
+# ─── CRITICAL FIX: FORCED INITIALIZATION FOR PRODUCTION (GUNICORN) ───
+with app.app_context():
+    try:
+        db.create_all()
+        print("✅ Database successfully initialized and tables created.")
+    except Exception as e:
+        print(f"❌ Initial DB Error: {str(e)}")
+# ─────────────────────────────────────────────────────────────────────
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-
 @app.route('/')
 def home():
-    return "Aashray Backend & Database is Running! 🚀"
-
+    return jsonify({
+        "status": "online",
+        "message": "Aashray Backend & Database is Running! 🚀"
+    })
 
 @app.route('/api/gemini', methods=['POST'])
 def call_gemini():
     data = request.json
     messages = data.get('messages', [])
     system_prompt = data.get('system', '')
-
-    # Check if this is the user chatting with Aasha, or an invisible background task
     is_chat = "You are Aasha" in system_prompt
 
     try:
-        # Save chat messages to DB
         if is_chat and messages:
             latest_user_msg = messages[-1]['content']
-            new_user_db_msg = ChatMessage(role='user', content=latest_user_msg)
-            db.session.add(new_user_db_msg)
+            db.session.add(ChatMessage(role='user', content=latest_user_msg))
             db.session.commit()
 
         gemini_history = []
@@ -69,16 +76,11 @@ def call_gemini():
             gemini_history.pop(0)
 
         if not gemini_history:
-            return jsonify({"error": "No valid user messages to process"}), 400
+            return jsonify({"error": "No valid user messages"}), 400
 
-        # 🚨 WE ARE NOW USING THE STABLE 2.0 MODEL 🚨
         model = genai.GenerativeModel(
             model_name="gemini-2.0-flash",
             system_instruction=system_prompt
-        )
-
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=data.get('max_tokens', 800)
         )
 
         safety_settings = {
@@ -90,35 +92,24 @@ def call_gemini():
 
         latest_prompt = gemini_history.pop()
 
-        # Use chat for Aasha, but use generate_content for quick scoring
         if is_chat:
             chat = model.start_chat(history=gemini_history)
-            response = chat.send_message(
-                latest_prompt['parts'][0],
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
+            response = chat.send_message(latest_prompt['parts'][0], safety_settings=safety_settings)
         else:
-            response = model.generate_content(
-                latest_prompt['parts'][0],
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
+            response = model.generate_content(latest_prompt['parts'][0], safety_settings=safety_settings)
 
         reply_text = response.text
 
         if is_chat:
-            new_bot_db_msg = ChatMessage(role='model', content=reply_text)
-            db.session.add(new_bot_db_msg)
+            db.session.add(ChatMessage(role='model', content=reply_text))
             db.session.commit()
 
         return jsonify({"reply": reply_text})
 
     except Exception as e:
-        print(f"Server Error: {e}")
+        print(f"Gemini Error: {e}")
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/api/save_assessment', methods=['POST'])
 def save_assessment():
@@ -136,13 +127,8 @@ def save_assessment():
     except Exception as e:
         print(f"Database Error: {e}")
         db.session.rollback()
-        return jsonify({"error": "Failed to save assessment"}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    with app.app_context():
-        # This line is the fix - it creates the tables if they don't exist
-        db.create_all() 
-    
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
